@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import starsim as ss
 
 
-__all__ = ['SIR', 'SIS']
+__all__ = ['SIR', 'SIS', 'SIRS']
 
 class SIR(ss.Infection):
     """
@@ -111,7 +111,7 @@ class SIS(ss.Infection):
         self.define_pars(
             beta = ss.beta(0.05),
             init_prev = ss.bernoulli(p=0.01),
-            dur_inf = ss.lognorm_ex(mean=ss.dur(10)),
+            dur_inf = ss.lognorm_ex(mean=ss.dur(6)),
             waning = ss.rate(0.05),
             imm_boost = 1.0,
         )
@@ -182,6 +182,124 @@ class SIS(ss.Infection):
         sc.commaticks()
         return ss.return_fig(fig)
 
+
+class SIRS(ss.Infection):
+    """
+    Example SIRS model
+
+    This class implements a basic SIRS model with states for susceptible,
+    infected/infectious, recovered, and back to susceptible based on waning immunity. 
+    Immunity is binary, so you are either completely immune ('recovered') or fully susceptible after waning.
+    It also includes deaths, and basic results.
+    """
+    def __init__(self, pars=None, *args, **kwargs):
+        super().__init__()
+        self.define_pars(
+            beta = ss.beta(0.05),
+            init_prev = ss.bernoulli(p=0.01),
+            dur_inf = ss.lognorm_ex(mean=ss.dur(6)),
+            p_death = ss.bernoulli(p=0.01),
+            waning = ss.expon(scale=ss.dur(20)),
+        )
+        self.update_pars(pars=pars, *args, **kwargs)
+
+        self.define_states(
+            ss.State('susceptible', default=True, label='Susceptible'),
+            ss.State('infected', label='Infectious'),
+            ss.State('recovered', label='Recovered'),
+            ss.FloatArr('ti_infected', label='Time of infection'),
+            ss.FloatArr('ti_recovered', label='Time of recovery'),
+            ss.FloatArr('ti_waned', label='Time of waned back to susceptible'),
+            ss.FloatArr('ti_dead', label='Time of death'),
+            ss.FloatArr('rel_sus', default=1.0, label='Relative susceptibility'),
+            ss.FloatArr('rel_trans', default=1.0, label='Relative transmission'),
+            ss.FloatArr('n_infected', default=0, label='Number of infections'),
+        )
+        return
+    
+    def step_state(self):
+        """ Progress infectious -> recovered """
+        recovered = (self.infected & (self.ti_recovered <= self.ti)).uids
+        self.infected[recovered] = False
+        self.recovered[recovered] = True
+
+        """ Progress recoved -> susceptible """
+        waned = (self.recovered & (self.ti_waned <= self.ti)).uids
+        self.recovered[waned] = False
+        self.susceptible[waned] = True    
+
+         # Trigger deaths
+        deaths = (self.ti_dead <= self.sim.ti).uids
+        if len(deaths):
+            self.sim.people.request_death(deaths)
+    
+        return
+
+    def set_prognoses(self, uids, sources=None):
+        """ Set prognoses """
+        super().set_prognoses(uids, sources)
+        self.susceptible[uids] = False
+        self.infected[uids] = True
+        self.ti_infected[uids] = self.t.ti
+        self.n_infected[uids] += 1
+
+        # Sample duration of infection
+        dur_inf = self.pars.dur_inf.rvs(uids)
+
+        # Sample waning duration
+        dur_waning = self.pars.waning.rvs(uids)
+
+        # Determine who dies and who recovers and when
+        will_die = self.pars.p_death.rvs(uids)
+        dead_uids = uids[will_die]
+        rec_uids = uids[~will_die]
+        self.ti_dead[dead_uids] = self.t.ti + dur_inf[will_die] # Consider rand round, but not CRN safe
+        self.ti_recovered[rec_uids] = self.t.ti + dur_inf[~will_die]
+        self.ti_waned[rec_uids] = self.t.ti + dur_inf[~will_die] + dur_waning[~will_die]
+
+        return
+
+    def step_die(self, uids):
+        """ Reset infected/recovered flags for dead agents """
+        self.susceptible[uids] = False
+        self.infected[uids] = False
+        self.recovered[uids] = False
+        return
+    
+    def init_results(self):
+        """ Initialize results """
+        super().init_results()
+        self.define_results(
+            ss.Result('infected_once', dtype=float, label='Number infected once'),
+            ss.Result('infected_twice', dtype=float, label='Number infected twice'),
+            ss.Result('infected_3p', dtype=float, label='Number infected 3+'),
+            ss.Result('cumulative_reinfections', dtype=float, label='Cumulative reinfections'),
+        )
+        return
+
+    def update_results(self):
+        """ Store results with new variables for reinfections """
+        super().update_results()
+        self.results['infected_once'][self.ti] = (self.n_infected==1).sum()
+        self.results['infected_twice'][self.ti] = (self.n_infected==2).sum()
+        self.results['infected_3p'][self.ti] = (self.n_infected>=3).sum()
+        self.results['cumulative_reinfections'][self.ti] = np.sum(self.n_infected[self.n_infected>1]-1)
+        return
+
+    def plot(self, **kwargs):
+        """ Default plot for SIRS model """
+        fig = plt.figure()
+        kw = sc.mergedicts(dict(lw=2, alpha=0.8), kwargs)
+        res = self.results
+        for rkey in ['n_susceptible', 'n_infected']:
+            plt.plot(res.timevec, res[rkey], label=res[rkey].label, **kw)
+        plt.legend(frameon=False)
+        plt.xlabel('Time')
+        plt.ylabel('Number of people')
+        plt.ylim(bottom=0)
+        sc.boxoff()
+        sc.commaticks()
+        return ss.return_fig(fig)
 
 # %% Interventions
 
